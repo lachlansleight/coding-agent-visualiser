@@ -12,6 +12,8 @@
 //
 // Clients (the web viewer, later a VS Code extension) connect to ws://…/ws.
 import http from 'node:http';
+import crypto from 'node:crypto';
+import { execFile } from 'node:child_process';
 import https from 'node:https';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -25,7 +27,14 @@ const HOST = '127.0.0.1';
 const UPSTREAM = new URL(process.env.AGENT_VIS_UPSTREAM || 'https://api.anthropic.com');
 const TEE_STDOUT = process.env.AGENT_VIS_TEE !== '0';
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
-const VIEWER = path.join(ROOT, 'viewer', 'index.html');
+const APP_INDEX = path.join(ROOT, 'visualiser', 'index.html');
+const LOG_VIEWER = path.join(ROOT, 'viewer', 'index.html');
+// URL prefix -> directory of files the browser may load.
+const STATIC_DIRS = [
+  { prefix: '/app/', dir: path.join(ROOT, 'visualiser') },
+  { prefix: '/vendor/highlight/', dir: path.join(ROOT, 'node_modules', '@highlightjs', 'cdn-assets') },
+  { prefix: '/recordings/', dir: path.join(ROOT, 'recordings') },
+];
 const TEE_DIR = path.join(os.tmpdir(), 'agent-vis', 'stdout');
 const BOOT = Date.now().toString(36);
 
@@ -35,11 +44,13 @@ fs.mkdirSync(TEE_DIR, { recursive: true });
 
 let seq = 0;
 const backlog = [];
-const BACKLOG_MAX = 3000;
+const BACKLOG_MAX = 8000;
+const sticky = new Map(); // key -> latest state event that a late-joining client still needs
 const clients = new Set();
 
-function emit(source, kind, data = {}, session) {
+function emit(source, kind, data = {}, session, stickyKey) {
   const ev = { seq: ++seq, ts: Date.now(), source, kind, session: session || undefined, data };
+  if (stickyKey) sticky.set(stickyKey, ev);
   backlog.push(ev);
   if (backlog.length > BACKLOG_MAX) backlog.shift();
   const text = JSON.stringify(ev);
@@ -152,9 +163,9 @@ function summariseTranscript(entry) {
     if (Array.isArray(content)) {
       out.blocks = content.map((b) => {
         if (b.type === 'thinking') {
-          return { type: 'thinking', chars: (b.thinking || '').length, signatureChars: (b.signature || '').length, thinking: clip(b.thinking || '', 2000) };
+          return { type: 'thinking', chars: (b.thinking || '').length, signatureChars: (b.signature || '').length, thinking: clip(b.thinking || '', 20000) };
         }
-        if (b.type === 'text') return { type: 'text', chars: b.text.length, text: clip(b.text, 2000) };
+        if (b.type === 'text') return { type: 'text', chars: b.text.length, text: clip(b.text, 20000) };
         if (b.type === 'tool_use') return { type: 'tool_use', id: b.id, name: b.name, input: clip(b.input, 1000) };
         if (b.type === 'tool_result') return { type: 'tool_result', tool_use_id: b.tool_use_id, is_error: b.is_error, content: clip(b.content, 1000) };
         return { type: b.type };
@@ -198,22 +209,88 @@ function stopStdoutTail(id) {
   }, 200);
 }
 
+// ---------------------------------------------------------------- git graph
+
+// Each session's working folder is polled for its commit graph while the session
+// is active. A 'graph' event goes out only when the graph changes.
+const gitWatch = new Map(); // cwd -> { sessions: Map<session, sentSignature>, lastActive, busy }
+
+function git(cwd, args) {
+  return new Promise((resolve) => {
+    execFile('git', args, { cwd, timeout: 4000, windowsHide: true, maxBuffer: 4e6 }, (err, stdout) => resolve(err ? null : stdout));
+  });
+}
+
+function watchGit(cwd, session) {
+  if (!cwd || !session) return;
+  let w = gitWatch.get(cwd);
+  if (!w) gitWatch.set(cwd, (w = { sessions: new Map(), lastActive: 0, busy: false }));
+  if (!w.sessions.has(session)) w.sessions.set(session, null);
+  w.lastActive = Date.now();
+}
+
+async function pollGit(cwd) {
+  const w = gitWatch.get(cwd);
+  if (!w || w.busy) return;
+  w.busy = true;
+  try {
+    const out = await git(cwd, ['log', '--all', '--date-order', '-n', '60', '--format=%H%x1f%P%x1f%s%x1f%ct%x1f%D']);
+    if (out === null) return; // not a repository, or no commits yet
+    const branch = ((await git(cwd, ['rev-parse', '--abbrev-ref', 'HEAD'])) || '').trim();
+    const head = ((await git(cwd, ['rev-parse', 'HEAD'])) || '').trim();
+    const signature = crypto.createHash('sha1').update(out + branch + head).digest('hex');
+    const commits = out.split('\n').filter(Boolean).map((line) => {
+      const [sha, parents, subject, time, refs] = line.split('\x1f');
+      return { sha, parents: parents ? parents.split(' ') : [], subject, time: Number(time), refs: refs ? refs.split(', ') : [] };
+    });
+    for (const [session, sent] of w.sessions) {
+      if (sent === signature) continue;
+      w.sessions.set(session, signature);
+      emit('git', 'graph', { cwd, branch, head, commits }, session, `git:${session}`);
+    }
+  } finally {
+    w.busy = false;
+  }
+}
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [cwd, w] of gitWatch) if (now - w.lastActive < 120000) pollGit(cwd);
+}, 3000).unref();
+
 // ---------------------------------------------------------------- hooks
 
 // Reply for a Bash PreToolUse hook: prefix the command so its stdout and stderr
-// are also appended to a file we tail. The command itself is otherwise untouched.
+// are also copied to a file we tail. The command itself is otherwise untouched.
 function teeRewrite(p) {
   const id = String(p.tool_use_id || `t${Date.now()}`).replace(/[^\w-]/g, '');
   const file = path.join(TEE_DIR, `${id}.log`).replace(/\\/g, '/');
   fs.writeFileSync(file, '');
   startStdoutTail(id, file, p.session_id);
-  const prefix = `exec > >(tee -a '${file}') 2> >(tee -a '${file}' >&2); `;
+  const prefix = `${TEE_PREFIX} ${shellQuote(file)}; `;
   return {
     hookSpecificOutput: {
       hookEventName: 'PreToolUse',
       updatedInput: { ...p.tool_input, command: prefix + p.tool_input.command },
     },
   };
+}
+
+// Single-quotes a string for bash.
+const shellQuote = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
+
+// Rewritten commands start by sourcing tee.sh, which copies their output to a
+// file the forwarder tails and makes sure nothing is lost when the shell exits.
+const TEE_SCRIPT = path.join(ROOT, 'forwarder', 'tee.sh').replace(/\\/g, '/');
+const TEE_PREFIX = `. ${shellQuote(TEE_SCRIPT)}`;
+
+// Whether a Bash call may be rewritten for live output.
+// - Auto mode reviews a command before hooks run; changing it afterwards voids
+//   the review and the agent has to issue every command twice. So never there.
+// - A command that already carries our prefix must not be wrapped again.
+function canRewrite(p) {
+  const command = p.tool_input?.command;
+  return typeof command === 'string' && p.permission_mode !== 'auto' && !command.startsWith(TEE_PREFIX);
 }
 
 async function handleHook(req, res) {
@@ -225,11 +302,15 @@ async function handleHook(req, res) {
     return;
   }
   const kind = p.hook_event_name || 'unknown';
-  emit('hook', kind, clip(p), p.session_id);
+  emit('hook', kind, clip(p, 16000), p.session_id);
   if (p.transcript_path) tailTranscript(p.transcript_path, p.session_id);
+  if (p.cwd) {
+    watchGit(p.cwd, p.session_id);
+    if (kind === 'PostToolUse' || kind === 'Stop' || kind === 'UserPromptSubmit') pollGit(p.cwd);
+  }
 
   let reply = null;
-  if (kind === 'PreToolUse' && p.tool_name === 'Bash' && TEE_STDOUT && typeof p.tool_input?.command === 'string') {
+  if (kind === 'PreToolUse' && p.tool_name === 'Bash' && TEE_STDOUT && canRewrite(p)) {
     reply = teeRewrite(p);
   }
   if ((kind === 'PostToolUse' || kind === 'PostToolUseFailure') && p.tool_use_id) {
@@ -257,6 +338,27 @@ function describeHeaders(headers) {
   return { names: Object.keys(headers), shown };
 }
 
+// What kind of credential a request carries, never the credential itself.
+function credentialKind(token) {
+  if (token.startsWith('sk-ant-oat')) return 'claude.ai login token';
+  if (token.startsWith('sk-ant-api')) return 'Anthropic API key';
+  if (token.startsWith('sk-ant-')) return 'other Anthropic credential';
+  return 'not an Anthropic credential format';
+}
+
+function describeAuth(headers) {
+  const out = {};
+  if (headers.authorization) {
+    const [scheme, token = ''] = String(headers.authorization).split(' ');
+    out.authorization = { scheme, kind: credentialKind(token), chars: token.length };
+  }
+  if (headers['x-api-key']) {
+    const key = String(headers['x-api-key']);
+    out.xApiKey = { kind: credentialKind(key), chars: key.length };
+  }
+  return out;
+}
+
 function describeRequestBody(body) {
   let j;
   try {
@@ -276,6 +378,8 @@ function describeRequestBody(body) {
       output_config: j.output_config,
       messages: j.messages?.length,
       tools: j.tools?.length,
+      // Stable per agent: lets a client tell the main loop's requests from a subagent's.
+      systemHash: crypto.createHash('sha1').update(JSON.stringify(j.system ?? '')).digest('hex').slice(0, 10),
       lastMessageRole: last?.role,
       lastMessageBlocks: Array.isArray(last?.content) ? last.content.map((b) => b.type) : typeof last?.content,
       bodyKeys: Object.keys(j),
@@ -361,9 +465,12 @@ async function handleProxy(req, res) {
   const body = await readBody(req);
   const pathOnly = req.url.split('?')[0];
   const isMessages = req.method === 'POST' && /\/v1\/messages$/.test(pathOnly);
-  const { info, session } = isMessages ? describeRequestBody(body) : { info: {}, session: undefined };
+  const described = isMessages ? describeRequestBody(body) : { info: {}, session: undefined };
+  const info = described.info;
+  // Claude Code names its session in a request header; the body is only a fallback.
+  const session = String(req.headers['x-claude-code-session-id'] || '') || described.session;
 
-  emit('proxy', 'request', { req: id, method: req.method, path: pathOnly, bytes: body.length, ...info, headers: describeHeaders(req.headers) }, session);
+  emit('proxy', 'request', { req: id, method: req.method, path: pathOnly, bytes: body.length, ...info, auth: describeAuth(req.headers), headers: describeHeaders(req.headers) }, session);
 
   const headers = { ...req.headers, host: UPSTREAM.host };
   delete headers['accept-encoding']; // keep the response uncompressed so the stream is readable
@@ -425,6 +532,45 @@ function isLocalHostHeader(req) {
   return LOCAL_HOSTS.has(String(req.headers.host || '').toLowerCase());
 }
 
+const CONTENT_TYPES = {
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.json': 'application/json',
+  '.jsonl': 'application/x-ndjson; charset=utf-8',
+  '.svg': 'image/svg+xml',
+};
+
+// The local file a GET path maps to; null if it escapes its directory;
+// undefined if the path is not ours (and so belongs to the API proxy).
+function staticFile(pathOnly) {
+  if (pathOnly === '/' || pathOnly === '/index.html') return APP_INDEX;
+  if (pathOnly === '/log') return LOG_VIEWER;
+  for (const { prefix, dir } of STATIC_DIRS) {
+    if (!pathOnly.startsWith(prefix)) continue;
+    let rel;
+    try {
+      rel = decodeURIComponent(pathOnly.slice(prefix.length));
+    } catch {
+      return null;
+    }
+    const file = path.resolve(dir, rel);
+    return file.startsWith(dir + path.sep) ? file : null;
+  }
+  return undefined;
+}
+
+function sendFile(res, file) {
+  fs.readFile(file, (err, data) => {
+    if (err) {
+      res.writeHead(404).end('not found');
+      return;
+    }
+    res.writeHead(200, { 'content-type': CONTENT_TYPES[path.extname(file)] || 'application/octet-stream', 'cache-control': 'no-store' });
+    res.end(data);
+  });
+}
+
 const server = http.createServer((req, res) => {
   const pathOnly = req.url.split('?')[0];
   const fail = (e) => {
@@ -435,19 +581,11 @@ const server = http.createServer((req, res) => {
 
   if (req.method === 'POST' && pathOnly === '/hook') {
     handleHook(req, res).catch(fail);
-  } else if (req.method === 'GET' && (pathOnly === '/' || pathOnly === '/index.html')) {
-    if (!isLocalHostHeader(req)) {
-      res.writeHead(403).end();
-      return;
-    }
-    fs.readFile(VIEWER, (err, html) => {
-      if (err) {
-        res.writeHead(500).end('viewer missing');
-        return;
-      }
-      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
-      res.end(html);
-    });
+  } else if (req.method === 'GET' && staticFile(pathOnly) !== undefined) {
+    const file = staticFile(pathOnly);
+    if (!isLocalHostHeader(req)) res.writeHead(403).end();
+    else if (file === null) res.writeHead(404).end('not found');
+    else sendFile(res, file);
   } else if (pathOnly === '/favicon.ico') {
     res.writeHead(204).end(); // the viewer's own request; never send it upstream
   } else if (req.method === 'GET' && pathOnly === '/health') {
@@ -474,12 +612,15 @@ server.on('upgrade', (req, socket, head) => {
     ws.on('error', () => clients.delete(ws));
     ws.send(JSON.stringify({ hello: true, boot: BOOT }));
     for (const ev of backlog) ws.send(JSON.stringify(ev));
+    // State that may have scrolled out of the backlog, flagged so clients apply it regardless of order.
+    for (const ev of sticky.values()) ws.send(JSON.stringify({ ...ev, resend: true }));
   });
 });
 
 server.listen(PORT, HOST, () => {
   console.log(`agent-vis forwarder on http://${HOST}:${PORT}`);
-  console.log(`  viewer      http://${HOST}:${PORT}/`);
+  console.log(`  visualiser  http://${HOST}:${PORT}/`);
+  console.log(`  event log   http://${HOST}:${PORT}/log`);
   console.log(`  hooks       POST http://${HOST}:${PORT}/hook`);
   console.log(`  api proxy   ANTHROPIC_BASE_URL=http://${HOST}:${PORT}  ->  ${UPSTREAM.origin}`);
   console.log(`  live stdout ${TEE_STDOUT ? `on (${TEE_DIR})` : 'off'}`);

@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agent visualiser</title>
+<link rel="stylesheet" href="/app/style.css">
+</head>
+<body>
+<div id="app">
+  <aside id="rail" aria-label="Commit graph"></aside>
+  <main id="stage" aria-label="Sessions"></main>
+</div>
+<div id="bar">
+  <span id="conn" class="down">disconnected</span>
+  <span id="replay-info"></span>
+  <span class="spacer"></span>
+  <label title="Keep every session open instead of following the active one"><input type="checkbox" id="opt-expand-all"> expand all</label>
+  <label title="Shortest time a session stays open once it has opened">stay open <input type="number" id="opt-min-open" min="0" max="120" step="1"> s</label>
+  <label title="Show the commit graph"><input type="checkbox" id="opt-graph"> commits</label>
+  <a href="/log" target="_blank" rel="noopener">event log</a>
+</div>
+<div id="empty">Waiting for a Claude Code session…</div>
+<script type="module" src="/app/main.js"></script>
+</body>
+</html>

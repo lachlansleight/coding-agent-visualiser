@@ -131,7 +131,7 @@ function summary(ev) {
     return parts.join('  ');
   }
   if (ev.source === 'proxy') {
-    if (ev.kind === 'request') return `#${d.req} ${d.method} ${d.path}  ${d.model || ''}  ${d.messages != null ? d.messages + ' msgs' : ''}  ${d.stream ? 'stream' : ''}  ${d.bytes} bytes`;
+    if (ev.kind === 'request') return `#${d.req} ${d.method} ${d.path}  ${d.model || ''}  ${d.messages != null ? d.messages + ' msgs' : ''}  ${d.stream ? 'stream' : ''}  ${d.bytes} bytes  ${d.auth?.authorization ? 'auth: ' + d.auth.authorization.kind : d.auth?.xApiKey ? 'x-api-key: ' + d.auth.xApiKey.kind : 'no credential'}`;
     if (ev.kind === 'response') return `#${d.req} ${d.status}  ${d.contentType}  after ${d.ms} ms`;
     if (ev.kind === 'response_end') return `#${d.req} ${d.bytes} bytes in ${d.ms} ms`;
     if (ev.kind === 'stream.message_start') return `#${d.req} ${d.model || ''}  ${brief(d.usage)}`;
@@ -152,6 +152,37 @@ function summary(ev) {
   }
   if (ev.source === 'forwarder') return brief(d);
   return brief(d);
+}
+
+// Text worth showing in full under a row, for sessions where nothing streams
+// (no proxy, no live output): prompts, replies, thoughts, file and command content.
+function inlineText(ev) {
+  const d = ev.data || {};
+  const parts = [];
+  if (ev.source === 'transcript' && d.blocks) {
+    for (const b of d.blocks) {
+      if (b.type === 'text' && b.text) parts.push(b.text);
+      if (b.type === 'thinking' && b.thinking) parts.push('[thinking]\n' + b.thinking);
+    }
+  }
+  if (ev.source === 'hook') {
+    const input = d.tool_input || {};
+    const out = d.tool_response;
+    if (ev.kind === 'UserPromptSubmit' && d.prompt) parts.push(d.prompt);
+    if ((ev.kind === 'Stop' || ev.kind === 'SubagentStop') && d.last_assistant_message) parts.push(d.last_assistant_message);
+    if (ev.kind === 'PreToolUse') {
+      if (typeof input.content === 'string') parts.push(input.content);
+      if (typeof input.old_string === 'string') parts.push('- ' + input.old_string.replace(/\n/g, '\n- '));
+      if (typeof input.new_string === 'string') parts.push('+ ' + input.new_string.replace(/\n/g, '\n+ '));
+    }
+    if (ev.kind === 'PostToolUse' && out && typeof out === 'object') {
+      if (typeof out.stdout === 'string' && out.stdout) parts.push(out.stdout);
+      if (typeof out.stderr === 'string' && out.stderr) parts.push('[stderr]\n' + out.stderr);
+      if (out.file && typeof out.file.content === 'string') parts.push(out.file.content);
+    }
+    if (ev.kind === 'PostToolUseFailure' && d.error) parts.push(String(d.error));
+  }
+  return parts.join('\n\n');
 }
 
 // ---- rows
@@ -262,10 +293,26 @@ function handle(ev) {
     appendLive(state, ev, d.text);
     return;
   }
+  if (ev.source === 'hook' && ev.kind === 'MessageDisplay') {
+    // Reply text as it is displayed: batches of completed lines for one message.
+    const key = `m:${d.message_id}`;
+    const state = live.get(key) || openLive(key, ev, 'MessageDisplay reply text');
+    appendLive(state, ev, d.delta || '');
+    if (d.final) closeLive(key, ev);
+    return;
+  }
   if (ev.source === 'hook' && /^PostToolUse/.test(ev.kind) && d.tool_use_id) {
     closeLive(`o:${d.tool_use_id}`, ev);
   }
-  makeRow(ev, ev.kind, summary(ev));
+  const r = makeRow(ev, ev.kind, summary(ev));
+  const body = inlineText(ev);
+  if (body) {
+    const pre = document.createElement('pre');
+    pre.className = 'live';
+    pre.textContent = body;
+    r.row.append(pre);
+    r.row.classList.toggle('hidden', !visible(r.row));
+  }
 }
 
 // ---- connection

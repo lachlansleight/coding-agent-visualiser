@@ -5,9 +5,14 @@
   "type": "module",
   "description": "Realtime view of what a coding agent is doing: hook forwarder, API pass-through proxy, and event viewer.",
   "scripts": {
-    "start": "node forwarder/server.mjs"
+    "start": "node forwarder/server.mjs",
+    "record": "node scripts/record.mjs",
+    "proxy:on": "node scripts/user-proxy.mjs on",
+    "proxy:off": "node scripts/user-proxy.mjs off",
+    "proxy:status": "node scripts/user-proxy.mjs status"
   },
   "dependencies": {
+    "@highlightjs/cdn-assets": "^11.12.0",
     "ws": "^8.18.0"
   }
 }
