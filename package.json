@@ -3,10 +3,13 @@
   "version": "0.0.1",
   "private": true,
   "type": "module",
-  "description": "Realtime view of what a coding agent is doing: hook forwarder, API pass-through proxy, and event viewer.",
+  "description": "Realtime view of what a Claude Code agent is doing: hook forwarder, API pass-through proxy, and a browser visualiser.",
   "scripts": {
     "start": "node forwarder/server.mjs",
     "record": "node scripts/record.mjs",
+    "hooks:on": "node scripts/user-hooks.mjs on",
+    "hooks:off": "node scripts/user-hooks.mjs off",
+    "hooks:status": "node scripts/user-hooks.mjs status",
     "proxy:on": "node scripts/user-proxy.mjs on",
     "proxy:off": "node scripts/user-proxy.mjs off",
     "proxy:status": "node scripts/user-proxy.mjs status"
@@ -14,5 +17,8 @@
   "dependencies": {
     "@highlightjs/cdn-assets": "^11.12.0",
     "ws": "^8.18.0"
+  },
+  "engines": {
+    "node": ">=22"
   }
 }

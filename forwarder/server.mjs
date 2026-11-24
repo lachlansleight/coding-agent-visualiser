@@ -25,7 +25,10 @@ import { WebSocketServer } from 'ws';
 const PORT = Number(process.env.AGENT_VIS_PORT || 4517);
 const HOST = '127.0.0.1';
 const UPSTREAM = new URL(process.env.AGENT_VIS_UPSTREAM || 'https://api.anthropic.com');
-const TEE_STDOUT = process.env.AGENT_VIS_TEE !== '0';
+// Live shell output works by rewriting the agent's Bash commands (see tee.sh),
+// so a fault in it would change what the agent sees. It has only been verified
+// with Git Bash on Windows; elsewhere it stays off unless AGENT_VIS_TEE=1.
+const TEE_STDOUT = process.env.AGENT_VIS_TEE ? process.env.AGENT_VIS_TEE !== '0' : process.platform === 'win32';
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const APP_INDEX = path.join(ROOT, 'visualiser', 'index.html');
 const LOG_VIEWER = path.join(ROOT, 'viewer', 'index.html');
@@ -204,7 +207,7 @@ function stopStdoutTail(id) {
     entry.tail.tick();
     setTimeout(() => {
       entry.tail.stop();
-      fs.rm(entry.file, { force: true }, () => {});
+      for (const suffix of ['', '.out-done', '.err-done']) fs.rm(entry.file + suffix, { force: true }, () => {});
     }, 300);
   }, 200);
 }
