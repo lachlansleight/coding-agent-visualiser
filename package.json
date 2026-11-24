@@ -1,0 +1,13 @@
+{
+  "name": "coding-visualiser",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "Realtime view of what a coding agent is doing: hook forwarder, API pass-through proxy, and event viewer.",
+  "scripts": {
+    "start": "node forwarder/server.mjs"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

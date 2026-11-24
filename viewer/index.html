@@ -1,0 +1,289 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agent events</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0e1014; --panel: #161a21; --line: #262b35; --text: #cfd3da; --dim: #7c8492;
+    --hook: #e0a43a; --proxy: #4cc2d6; --transcript: #a98be8; --stdout: #6fcf7a; --forwarder: #7c8492;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 12px/1.45 ui-monospace, "Cascadia Mono", Consolas, monospace; }
+  header { position: sticky; top: 0; z-index: 1; display: flex; flex-wrap: wrap; gap: 6px 14px; align-items: center;
+    padding: 8px 12px; background: var(--panel); border-bottom: 1px solid var(--line); }
+  header label { display: inline-flex; gap: 5px; align-items: center; cursor: pointer; user-select: none; }
+  header input[type=text] { background: var(--bg); color: var(--text); border: 1px solid var(--line); padding: 3px 6px; font: inherit; width: 200px; }
+  header button { background: var(--bg); color: var(--text); border: 1px solid var(--line); padding: 3px 10px; font: inherit; cursor: pointer; }
+  #status { font-weight: bold; }
+  #status.up { color: var(--stdout); } #status.down { color: #e06c6c; }
+  .count { color: var(--dim); }
+  .row { border-bottom: 1px solid var(--line); }
+  .row.hidden { display: none; }
+  .head { display: grid; grid-template-columns: 96px 84px 250px 74px minmax(0, 1fr); gap: 10px; padding: 2px 12px; cursor: pointer; }
+  .head:hover { background: var(--panel); }
+  .head > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .t, .sess, .meta { color: var(--dim); }
+  .src { font-weight: bold; }
+  [data-source=hook] .src { color: var(--hook); } [data-source=proxy] .src { color: var(--proxy); }
+  [data-source=transcript] .src { color: var(--transcript); } [data-source=stdout] .src { color: var(--stdout); }
+  [data-source=forwarder] .src { color: var(--forwarder); }
+  pre { margin: 0; padding: 4px 12px 6px 202px; white-space: pre-wrap; overflow-wrap: anywhere; }
+  pre.live { color: #e9ecf1; max-height: 260px; overflow: auto; }
+  pre.json { color: var(--dim); background: #0a0c10; }
+  .row.open-stream .kind::after { content: " ●"; color: #e06c6c; }
+  @media (max-width: 800px) {
+    .head { grid-template-columns: 64px 70px minmax(0, 1fr); }
+    .head .sess, .head .sum { display: none; }
+    pre { padding-left: 12px; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <span id="status" class="down">disconnected</span>
+  <span id="filters"></span>
+  <input type="text" id="search" placeholder="filter text…">
+  <label><input type="checkbox" id="follow" checked> follow</label>
+  <button id="clear">clear</button>
+  <span class="count" id="total"></span>
+</header>
+<main id="log"></main>
+
+<script>
+const SOURCES = ['hook', 'proxy', 'transcript', 'stdout', 'forwarder'];
+const MAX_ROWS = 4000;
+const log = document.getElementById('log');
+const statusEl = document.getElementById('status');
+const searchEl = document.getElementById('search');
+const followEl = document.getElementById('follow');
+const counts = Object.fromEntries(SOURCES.map((s) => [s, 0]));
+const enabled = Object.fromEntries(SOURCES.map((s) => [s, true]));
+const live = new Map(); // coalescing key -> live row state
+let lastSeq = 0;
+let boot = null;
+let total = 0;
+
+// ---- header
+
+const filtersEl = document.getElementById('filters');
+for (const s of SOURCES) {
+  const label = document.createElement('label');
+  label.innerHTML = `<input type="checkbox" checked data-src="${s}"> <span style="color:var(--${s})">${s}</span> <span class="count" id="count-${s}">0</span>`;
+  label.querySelector('input').addEventListener('change', (e) => {
+    enabled[s] = e.target.checked;
+    refilter();
+  });
+  filtersEl.append(label, ' ');
+}
+searchEl.addEventListener('input', refilter);
+document.getElementById('clear').addEventListener('click', () => {
+  log.textContent = '';
+  live.clear();
+});
+
+function visible(row) {
+  if (!enabled[row.dataset.source]) return false;
+  const q = searchEl.value.trim().toLowerCase();
+  return !q || row.textContent.toLowerCase().includes(q);
+}
+function refilter() {
+  for (const row of log.children) row.classList.toggle('hidden', !visible(row));
+}
+
+// ---- formatting
+
+function fmtTime(ts) {
+  const d = new Date(ts);
+  return d.toTimeString().slice(0, 8) + '.' + String(d.getMilliseconds()).padStart(3, '0');
+}
+function brief(v, max = 220) {
+  if (v === undefined || v === null) return '';
+  const s = typeof v === 'string' ? v : JSON.stringify(v);
+  const one = s.replace(/\s+/g, ' ');
+  return one.length > max ? one.slice(0, max) + '…' : one;
+}
+function briefInput(i) {
+  if (!i || typeof i !== 'object') return brief(i);
+  if (i.file_path) {
+    const range = i.offset != null || i.limit != null ? ` [from ${i.offset ?? 0}, ${i.limit ?? 'all'} lines]` : '';
+    return i.file_path + range;
+  }
+  if (i.command) return brief(i.command);
+  if (i.pattern) return i.pattern + (i.path ? `  in ${i.path}` : '');
+  return brief(i);
+}
+function summary(ev) {
+  const d = ev.data || {};
+  if (ev.source === 'hook') {
+    const parts = [];
+    if (d.tool_name) parts.push(d.tool_name, briefInput(d.tool_input));
+    if (d.prompt) parts.push(brief(d.prompt));
+    if (d.tool_response !== undefined) parts.push('→ ' + brief(d.tool_response, 160));
+    if (d.error) parts.push('✗ ' + brief(d.error));
+    if (d.message) parts.push(brief(d.message));
+    if (d.last_assistant_message) parts.push(brief(d.last_assistant_message));
+    if (d.agent_type) parts.push(`agent ${d.agent_type}`);
+    if (d.source) parts.push(d.source);
+    if (d.reason) parts.push(d.reason);
+    return parts.join('  ');
+  }
+  if (ev.source === 'proxy') {
+    if (ev.kind === 'request') return `#${d.req} ${d.method} ${d.path}  ${d.model || ''}  ${d.messages != null ? d.messages + ' msgs' : ''}  ${d.stream ? 'stream' : ''}  ${d.bytes} bytes`;
+    if (ev.kind === 'response') return `#${d.req} ${d.status}  ${d.contentType}  after ${d.ms} ms`;
+    if (ev.kind === 'response_end') return `#${d.req} ${d.bytes} bytes in ${d.ms} ms`;
+    if (ev.kind === 'stream.message_start') return `#${d.req} ${d.model || ''}  ${brief(d.usage)}`;
+    if (ev.kind === 'stream.message_delta') return `#${d.req} ${brief(d.delta)}  ${brief(d.usage)}`;
+    return `#${d.req ?? ''} ${brief(d.raw ?? d.message ?? '')}`;
+  }
+  if (ev.source === 'transcript') {
+    if (d.blocks) {
+      return (d.role || '') + '  ' + d.blocks.map((b) => {
+        if (b.type === 'thinking') return `thinking(${b.chars} chars, signature ${b.signatureChars})`;
+        if (b.type === 'text') return `text(${b.chars}) ${brief(b.text, 120)}`;
+        if (b.type === 'tool_use') return `tool_use ${b.name} ${briefInput(b.input)}`;
+        if (b.type === 'tool_result') return `tool_result ${brief(b.content, 120)}`;
+        return b.type;
+      }).join(' | ');
+    }
+    return d.subtype || (d.keys ? d.keys.join(',') : '');
+  }
+  if (ev.source === 'forwarder') return brief(d);
+  return brief(d);
+}
+
+// ---- rows
+
+function makeRow(ev, kindText, sumText) {
+  const row = document.createElement('div');
+  row.className = 'row';
+  row.dataset.source = ev.source;
+  const head = document.createElement('div');
+  head.className = 'head';
+  const cell = (cls, text) => {
+    const s = document.createElement('span');
+    s.className = cls;
+    s.textContent = text;
+    head.append(s);
+    return s;
+  };
+  cell('t', fmtTime(ev.ts));
+  cell('src', ev.source);
+  const kind = cell('kind', kindText);
+  cell('sess', ev.session ? ev.session.slice(0, 8) : '');
+  const sum = cell('sum', sumText);
+  row.append(head);
+  head.addEventListener('click', () => {
+    const existing = row.querySelector('pre.json');
+    if (existing) existing.remove();
+    else {
+      const pre = document.createElement('pre');
+      pre.className = 'json';
+      pre.textContent = JSON.stringify(ev, null, 2);
+      row.append(pre);
+    }
+  });
+  const stick = followEl.checked && window.innerHeight + window.scrollY >= document.body.scrollHeight - 40;
+  row.classList.toggle('hidden', !visible(row));
+  log.append(row);
+  while (log.children.length > MAX_ROWS) log.firstChild.remove();
+  if (stick) window.scrollTo(0, document.body.scrollHeight);
+  return { row, kind, sum };
+}
+
+// A row that keeps growing: a streamed content block or a command's live stdout.
+function openLive(key, ev, kindText) {
+  const r = makeRow(ev, kindText, '');
+  r.sum.classList.add('meta');
+  r.row.classList.add('open-stream');
+  const pre = document.createElement('pre');
+  pre.className = 'live';
+  r.row.append(pre);
+  const state = { ...r, pre, t0: ev.ts, chars: 0, parts: 0, sig: 0 };
+  live.set(key, state);
+  return state;
+}
+function appendLive(state, ev, text) {
+  const stick = followEl.checked && window.innerHeight + window.scrollY >= document.body.scrollHeight - 40;
+  state.parts++;
+  if (text) {
+    state.chars += text.length;
+    state.pre.append(text);
+    state.pre.scrollTop = state.pre.scrollHeight;
+  }
+  if (ev.data.signatureChars) state.sig += ev.data.signatureChars;
+  const secs = ((ev.ts - state.t0) / 1000).toFixed(1);
+  state.sum.textContent = `${state.chars} chars in ${state.parts} parts over ${secs}s` + (state.sig ? `, signature ${state.sig} chars` : '');
+  if (stick) window.scrollTo(0, document.body.scrollHeight);
+}
+function closeLive(key, ev) {
+  const state = live.get(key);
+  if (!state) return;
+  live.delete(key);
+  state.row.classList.remove('open-stream');
+  state.sum.textContent += `  (ended after ${((ev.ts - state.t0) / 1000).toFixed(1)}s)`;
+}
+
+function handle(ev) {
+  if (ev.hello) {
+    if (boot !== ev.boot) lastSeq = 0; // forwarder restarted
+    boot = ev.boot;
+    return;
+  }
+  if (ev.seq <= lastSeq) return;
+  lastSeq = ev.seq;
+  counts[ev.source] = (counts[ev.source] || 0) + 1;
+  total++;
+  const countEl = document.getElementById('count-' + ev.source);
+  if (countEl) countEl.textContent = counts[ev.source];
+  document.getElementById('total').textContent = `${total} events`;
+
+  const d = ev.data || {};
+  if (ev.source === 'proxy' && ev.kind === 'stream.ping') return;
+
+  if (ev.source === 'proxy' && /^stream\.content_block_/.test(ev.kind)) {
+    const key = `p:${d.req}:${d.index}`;
+    const label = `stream #${d.req} ${d.block || '?'}${d.name ? ' ' + d.name : ''}`;
+    if (ev.kind === 'stream.content_block_start') {
+      openLive(key, ev, label);
+    } else if (ev.kind === 'stream.content_block_delta') {
+      const state = live.get(key) || openLive(key, ev, label);
+      appendLive(state, ev, d.text ?? (d.raw ? JSON.stringify(d.raw) + '\n' : ''));
+    } else {
+      closeLive(key, ev);
+    }
+    return;
+  }
+  if (ev.source === 'stdout' && ev.kind === 'chunk') {
+    const key = `o:${d.tool_use_id}`;
+    const state = live.get(key) || openLive(key, ev, `live output ${String(d.tool_use_id).slice(-8)}`);
+    appendLive(state, ev, d.text);
+    return;
+  }
+  if (ev.source === 'hook' && /^PostToolUse/.test(ev.kind) && d.tool_use_id) {
+    closeLive(`o:${d.tool_use_id}`, ev);
+  }
+  makeRow(ev, ev.kind, summary(ev));
+}
+
+// ---- connection
+
+function connect() {
+  const ws = new WebSocket(`ws://${location.host}/ws`);
+  ws.onopen = () => {
+    statusEl.textContent = 'connected';
+    statusEl.className = 'up';
+  };
+  ws.onmessage = (e) => handle(JSON.parse(e.data));
+  ws.onclose = () => {
+    statusEl.textContent = 'disconnected';
+    statusEl.className = 'down';
+    setTimeout(connect, 1000);
+  };
+}
+connect();
+</script>
+</body>
+</html>
