@@ -1,6 +1,6 @@
 // Draws the store: sessions across the stage, a mosaic of tiles inside each,
 // and the commit graph in the rail. Runs once per animation frame.
-import { ENV, SIZE_STEPS, LIMITS } from './config.js';
+import { ENV, SIZE_STEPS, LIMITS, SCROLL_PASS_SHARE } from './config.js';
 import { levelOf, isGated, replyTextOf, commandOf, shellKindOf, toolLabel } from './model.js';
 import { Mosaic, layoutSessions, layoutGraph } from './layout.js';
 import { renderMarkdown, highlightLines } from './markdown.js';
@@ -31,11 +31,13 @@ export class View {
     this.app = els.app;
     this.views = new Map(); // session id -> view state
     this.lastFrame = 0;
-    this.size = { w: this.stage.clientWidth, h: this.stage.clientHeight };
-    new ResizeObserver(() => {
-      this.size = { w: this.stage.clientWidth, h: this.stage.clientHeight };
-    }).observe(this.stage);
+    this.measure();
+    new ResizeObserver(() => this.measure()).observe(this.stage);
     this.graph = { key: '', at: 0 };
+  }
+
+  measure() {
+    this.size = { w: this.stage.clientWidth, h: this.stage.clientHeight };
   }
 
   frame(now) {
@@ -164,7 +166,7 @@ export class View {
       const r = v.rects.get(key);
       const w = r ? r.w - GAP : 0;
       const h = r ? r.h - GAP : 0;
-      const visible = w >= 40 && h >= 22;
+      const visible = w >= 90 && h >= 22; // narrower than this holds nothing readable
       if (visible !== tv.visible) {
         tv.visible = visible;
         tv.el.hidden = !visible;
@@ -213,7 +215,7 @@ export class View {
         tv.metaAt = now;
         setText(tv.metaEl, tv.meta(now));
       }
-      if (drew || moved) this.scrollTile(tv);
+      this.autoScroll(tile, tv, now, gated, drew || moved);
     }
   }
 
@@ -242,10 +244,12 @@ export class View {
     el.hidden = true;
     el.innerHTML =
       '<header class="t-head"><span class="t-label"></span><span class="t-agent" hidden></span>' +
-      '<span class="t-title"></span><span class="t-meta"></span></header><div class="t-body"></div>';
+      '<span class="t-title"></span>' +
+      '<span class="t-manual" hidden title="You are scrolling this panel. Click to hand it back.">manual scroll</span>' +
+      '<span class="t-meta"></span></header><div class="t-body"></div>';
     v.body.append(el);
     v.mosaic.add(key, (k) => v.tiles.get(k)?.weight || 0);
-    return {
+    const tv = {
       el,
       kind: tile.kind,
       labelEl: el.querySelector('.t-label'),
@@ -262,8 +266,43 @@ export class View {
       meta: null,
       visible: false,
       box: '',
-      scroll: 'top',
+      manualEl: el.querySelector('.t-manual'),
+      follow: false, // content is being written: stay with its last line
+      stage: '',
+      epoch: -1,
+      manual: false, // the person has taken over scrolling
+      overflowing: false,
+      maxScroll: 0,
+      scrollSet: 0,
+      pass: null, // the current top-to-bottom pass: { from, start }
     };
+
+    // Scrolling by hand takes the panel away from the auto-scroller. It is
+    // handed back by the header chip, by new content replacing the old, or
+    // (while content is still being written) by scrolling back to the end.
+    const body = tv.bodyEl;
+    const take = () => {
+      if (!tv.overflowing || tv.manual) return;
+      tv.manual = true;
+      tv.manualEl.hidden = false;
+    };
+    body.addEventListener('wheel', take, { passive: true });
+    body.addEventListener('touchmove', take, { passive: true });
+    body.addEventListener('pointerdown', (e) => {
+      if (e.offsetX >= body.clientWidth) take(); // a press on the scrollbar
+    });
+    body.addEventListener('scroll', () => {
+      if (tv.manual && tv.follow && body.scrollTop >= body.scrollHeight - body.clientHeight - 2) this.handBack(tv);
+    });
+    tv.manualEl.addEventListener('click', () => this.handBack(tv));
+    return tv;
+  }
+
+  handBack(tv) {
+    tv.manual = false;
+    tv.manualEl.hidden = true;
+    tv.pass = null;
+    tv.scrollSet = tv.bodyEl.scrollTop;
   }
 
   fontSize(kind, w, h) {
@@ -272,13 +311,37 @@ export class View {
     return Math.round(raw * 2) / 2;
   }
 
-  scrollTile(tv) {
+  // Content taller than its tile is scrolled for the viewer. While it is still
+  // being written the tile stays with the newest line. Otherwise it makes one
+  // pass from where it is to the end, spread over the tile's release, so the
+  // whole of it has gone by when the tile fades out.
+  autoScroll(tile, tv, now, gated, changed) {
     const body = tv.bodyEl;
-    if (tv.scroll === 'bottom') body.scrollTop = body.scrollHeight;
-    else if (tv.scroll === 'top') body.scrollTop = 0;
-    else if (tv.scroll === 'mark') {
-      const mark = body.querySelector('.mark');
-      if (mark) body.scrollTop = Math.max(0, mark.offsetTop - body.clientHeight / 3);
+    if (changed) {
+      tv.maxScroll = Math.max(0, body.scrollHeight - body.clientHeight);
+      const overflowing = tv.maxScroll > 1;
+      if (overflowing !== tv.overflowing) {
+        tv.overflowing = overflowing;
+        tv.el.classList.toggle('overflowing', overflowing);
+        if (!overflowing && tv.manual) this.handBack(tv);
+      }
+    }
+    if (tv.manual || !tv.overflowing) return;
+    let target;
+    if (tv.follow) target = tv.maxScroll;
+    else if (gated) {
+      tv.pass = null; // still happening: the pass belongs to the release
+      return;
+    } else {
+      if (!tv.pass) tv.pass = { from: Math.min(body.scrollTop, tv.maxScroll), start: now };
+      const end = Math.max(tile.offAt, tile.holdUntil) + ENV[tile.env].release * SCROLL_PASS_SHARE;
+      const span = end - tv.pass.start;
+      const done = span > 0 ? clamp((now - tv.pass.start) / span, 0, 1) : 1;
+      target = tv.pass.from + (tv.maxScroll - tv.pass.from) * done;
+    }
+    if (changed || Math.abs(target - tv.scrollSet) >= 0.5) {
+      tv.scrollSet = target;
+      body.scrollTop = target;
     }
   }
 
@@ -297,7 +360,17 @@ export class View {
     setText(tv.metaEl, typeof out.meta === 'function' ? out.meta(now) : out.meta || '');
     tv.bodyEl.innerHTML = out.html;
     tv.need = out.need;
-    tv.scroll = out.scroll || 'top';
+    tv.follow = out.scroll === 'follow';
+    // New content in place of the old (not more of the same) starts again from the top.
+    const stage = out.stage || '';
+    if (tile.epoch !== tv.epoch || stage !== tv.stage) {
+      tv.epoch = tile.epoch;
+      tv.stage = stage;
+      if (tv.manual) this.handBack(tv);
+      tv.pass = null;
+      tv.scrollSet = 0;
+      tv.bodyEl.scrollTop = 0;
+    }
   }
 
   // ---------------------------------------------------------------- commit graph
@@ -383,7 +456,6 @@ function codeHtml(text, lang, startLine, fromEnd) {
 
 function patchHtml(hunks, lang) {
   const out = [];
-  let marked = false;
   hunks.forEach((hunk, n) => {
     if (n) out.push('<div class="gap">⋯</div>');
     const html = highlightLines(hunk.lines.map((l) => l.slice(1)).join('\n'), lang);
@@ -393,9 +465,7 @@ function patchHtml(hunks, lang) {
       const sign = line[0];
       const cls = sign === '+' ? 'add' : sign === '-' ? 'del' : '';
       const no = sign === '-' ? oldNo++ : sign === '+' ? newNo++ : (oldNo++, newNo++);
-      const mark = cls && !marked ? ' mark' : '';
-      if (mark) marked = true;
-      out.push(`<div class="ln ${cls}${mark}"><span class="no">${no}</span><span class="sign">${cls ? sign : ''}</span><span class="src">${html[i] || ' '}</span></div>`);
+      out.push(`<div class="ln ${cls}"><span class="no">${no}</span><span class="sign">${cls ? sign : ''}</span><span class="src">${html[i] || ' '}</span></div>`);
     });
   });
   return `<div class="code diff">${out.join('')}</div>`;
@@ -429,7 +499,7 @@ const DRAW = {
       html: `<div class="md">${renderMarkdown(text)}</div>`,
       // a subagent's reply can be a word or two; the main reply always keeps room
       need: needFor(text.length / 70 + linesOf(text), 16, tile.env === 'subreply' ? 0.2 : 0.5, 1.6),
-      scroll: 'bottom',
+      scroll: s.hasProxy ? 'follow' : 'pass', // without a token stream the text arrives a block at a time
     };
   },
 
@@ -441,7 +511,7 @@ const DRAW = {
       meta: (now) => fmtDuration((tile.endedAt || now) - tile.startedAt),
       html: text ? `<div class="think">${esc(text)}</div>` : '<div class="think quiet">No thinking text was sent for this step.</div>',
       need: text ? needFor(text.length / 80 + linesOf(text), 14, 0.5, 1.4) : 0.15,
-      scroll: 'bottom',
+      scroll: s.hasProxy ? 'follow' : 'pass',
     };
   },
 
@@ -493,7 +563,7 @@ const DRAW = {
         meta: `${linesOf(content)} lines`,
         html: codeHtml(content, lang, 1, writing),
         need: needFor(linesOf(content), 24),
-        scroll: writing ? 'bottom' : 'top',
+        scroll: writing ? 'follow' : 'pass',
       };
     }
     // edit
@@ -502,7 +572,7 @@ const DRAW = {
       const all = hunks.flatMap((h) => h.lines);
       const added = all.filter((l) => l[0] === '+').length;
       const removed = all.filter((l) => l[0] === '-').length;
-      return { tone: 'edit', label: 'Edit', title, meta: `+${added} −${removed}`, html: patchHtml(hunks, lang), need: needFor(all.length + hunks.length, 22), scroll: 'mark' };
+      return { tone: 'edit', label: 'Edit', title, meta: `+${added} −${removed}`, html: patchHtml(hunks, lang), need: needFor(all.length + hunks.length, 22), stage: 'patch' };
     }
     const oldText = input.old_string || '';
     const newText = input.new_string || '';
@@ -512,7 +582,7 @@ const DRAW = {
       title,
       html: draftDiffHtml(oldText, newText, lang),
       need: needFor(linesOf(oldText) + linesOf(newText), 22),
-      scroll: 'bottom',
+      scroll: call.state === 'calling' ? 'follow' : 'pass',
     };
   },
 
@@ -537,7 +607,7 @@ const DRAW = {
       meta: (now) => [failed ? (exit ? `exit ${exit[1]}` : 'failed') : '', meta(now)].filter(Boolean).join(' · '),
       html: `<div class="cmd"><span class="ps">$</span> ${esc(command)}</div>` + (output ? `<pre class="out">${esc(output.replace(/\r/g, ''))}</pre>` : ''),
       need: needFor(linesOf(command) + linesOf(output) + 1, 18),
-      scroll: 'bottom',
+      scroll: call.live && call.state === 'running' ? 'follow' : 'pass',
     };
   },
 
@@ -580,7 +650,6 @@ const DRAW = {
         (input.prompt ? `<div class="ask">${esc(truncate(input.prompt, 500))}</div>` : '') +
         (summary ? `<div class="md">${renderMarkdown(truncate(summary, 4000))}</div>` : call.state === 'failed' ? `<pre class="out err">${esc(call.error)}</pre>` : ''),
       need: needFor(linesOf(summary) + summary.length / 70 + 3, 16, 0.45, 1.3),
-      scroll: summary ? 'bottom' : 'top',
     };
   },
 

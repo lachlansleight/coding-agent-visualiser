@@ -135,6 +135,7 @@ export class Store {
         evictAt: 0,
         pulseAt: ts,
         version: 0,
+        epoch: 0, // bumped when the content is replaced rather than added to
         lineage: null,
         agentId: null,
       };
@@ -202,6 +203,7 @@ export class Store {
     }
     const tile = this.tile(s, key, call.family, env, ts);
     tile.env = env;
+    if (tile.call !== call) tile.epoch++;
     tile.call = call;
     tile.lineage = call.lineage;
     tile.agentId = call.agentId;
@@ -260,6 +262,7 @@ export class Store {
       const notice = /^\s*<task-notification>/.test(text);
       tile.notice = notice;
       tile.text = notice ? (/<summary>([\s\S]*?)<\/summary>/.exec(text)?.[1] || 'Background task finished').trim() : text;
+      tile.epoch++;
       tile.version++;
       touch(tile, ts);
     } else if (kind === 'PreToolUse') {
@@ -417,7 +420,7 @@ export class Store {
         this.phase(s, 'thinking', '', ts);
       } else if (d.block === 'text') {
         const tile = this.textTile(s, 'reply', lineage, ts);
-        if (s.staleReply.delete(tile.key)) tile.segments = [];
+        if (s.staleReply.delete(tile.key)) this.clearReply(tile);
         tile.segments.push({ id: gate, text: '' });
         tile.version++;
         openGate(tile, gate, ts);
@@ -434,7 +437,10 @@ export class Store {
       if (block.type === 'thinking') {
         const tile = this.textTile(s, 'thinking', lineage, ts);
         if (d.text) {
-          if (tile.replaceText) tile.text = '';
+          if (tile.replaceText) {
+            tile.text = '';
+            tile.epoch++;
+          }
           tile.replaceText = false;
           tile.text = (tile.text + d.text).slice(-LIMITS.replyChars);
           tile.version++;
@@ -512,6 +518,7 @@ export class Store {
         this.active(s, ts);
         const tile = this.textTile(s, 'thinking', null, ts);
         tile.text = block.thinking || '';
+        tile.epoch++;
         tile.startedAt = d.thinkingDurationMs ? ts - d.thinkingDurationMs : ts;
         tile.endedAt = ts;
         tile.version++;
@@ -520,10 +527,16 @@ export class Store {
     }
   }
 
+  // A new turn's reply replaces the last one.
+  clearReply(tile) {
+    tile.segments = [];
+    tile.epoch++;
+  }
+
   replyText(s, text, ts) {
     this.active(s, ts);
     const tile = this.textTile(s, 'reply', null, ts);
-    if (s.staleReply.delete(tile.key)) tile.segments = [];
+    if (s.staleReply.delete(tile.key)) this.clearReply(tile);
     if (tile.segments.some((x) => x.text === text)) return;
     tile.segments.push({ id: `t${ts}`, text });
     tile.version++;

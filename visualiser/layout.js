@@ -94,7 +94,9 @@ export class Mosaic {
       const ratio = w / Math.max(1, h);
       // A split is as good as its worse half; a half with almost no share is
       // on its way in or out and does not get a say.
-      const fit = (part, cw, ch) => (part < 0.03 ? 1 : Math.min(1, cw / READABLE_W) * Math.min(1, ch / READABLE_H));
+      // Lost width counts double: a column a few words wide is far worse than
+      // a strip a couple of lines tall.
+      const fit = (part, cw, ch) => (part < 0.03 ? 1 : Math.min(1, cw / READABLE_W) ** 2 * Math.min(1, ch / READABLE_H));
       const sideScore = Math.min(fit(share, w * share, h), fit(1 - share, w * (1 - share), h));
       const stackScore = Math.min(fit(share, w, h * share), fit(1 - share, w, h * (1 - share)));
       const margin = Math.abs(sideScore - stackScore);

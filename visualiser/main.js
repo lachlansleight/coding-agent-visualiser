@@ -48,10 +48,30 @@ const view = new View(store, settings, { app: $('app'), stage: $('stage'), rail:
 const conn = $('conn');
 const params = new URLSearchParams(location.search);
 
+// The clock can be paused and stepped by hand from the console (agentVis.debug),
+// which is also how the page is tested when its tab is not being painted.
+const debug = {
+  paused: false,
+  step(now) {
+    store.tick(now);
+    view.measure();
+    view.frame(now);
+  },
+};
+
+let lastError = '';
 function frame() {
-  const now = Date.now();
-  store.tick(now);
-  view.frame(now);
+  if (!debug.paused) {
+    try {
+      const now = Date.now();
+      store.tick(now);
+      view.frame(now);
+    } catch (e) {
+      // One bad frame must not stop the display for good.
+      if (String(e) !== lastError) console.error('frame failed:', e);
+      lastError = String(e);
+    }
+  }
   requestAnimationFrame(frame);
 }
 requestAnimationFrame(frame);
@@ -135,4 +155,4 @@ if (params.get('replay')) replay(params.get('replay'), Math.max(0.1, Number(para
 else connect();
 
 // For poking at state from the browser console.
-window.agentVis = { store, view, settings };
+window.agentVis = { store, view, settings, debug };
