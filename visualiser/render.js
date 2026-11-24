@@ -313,8 +313,8 @@ export class View {
 
   // Content taller than its tile is scrolled for the viewer. While it is still
   // being written the tile stays with the newest line. Otherwise it makes one
-  // pass from where it is to the end, spread over the tile's release, so the
-  // whole of it has gone by when the tile fades out.
+  // pass from where it is to the end, spread over most of the tile's release
+  // (SCROLL_PASS_SHARE), so the whole of it has gone by before the tile fades out.
   autoScroll(tile, tv, now, gated, changed) {
     const body = tv.bodyEl;
     if (changed) {
@@ -334,7 +334,8 @@ export class View {
       return;
     } else {
       if (!tv.pass) tv.pass = { from: Math.min(body.scrollTop, tv.maxScroll), start: now };
-      const end = Math.max(tile.offAt, tile.holdUntil) + ENV[tile.env].release * SCROLL_PASS_SHARE;
+      let end = Math.max(tile.offAt, tile.holdUntil) + ENV[tile.env].release * SCROLL_PASS_SHARE;
+      if (tile.decayFrom) end = Math.min(end, tile.decayFrom + LIMITS.turnDecayMs * SCROLL_PASS_SHARE);
       const span = end - tv.pass.start;
       const done = span > 0 ? clamp((now - tv.pass.start) / span, 0, 1) : 1;
       target = tv.pass.from + (tv.maxScroll - tv.pass.from) * done;

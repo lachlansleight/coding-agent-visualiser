@@ -29,13 +29,14 @@ export const SIZE_STEPS = [
 ];
 
 // Content taller than its tile scrolls from top to bottom while the tile
-// releases. 1 spreads the pass over the whole release; a smaller share finishes
-// it sooner, while the tile is still large.
-export const SCROLL_PASS_SHARE = 1;
+// releases. 1 would spread the pass over the whole release; a smaller share
+// finishes it sooner, while the tile is still large.
+export const SCROLL_PASS_SHARE = 0.8;
 
 export const LIMITS = {
   maxTilesPerSession: 10, // older quiet tiles are hurried out beyond this
   minGateMs: 500, // even an instant event keeps its tile lit this long
+  turnDecayMs: 10000, // when a new turn starts, what is left of the last one fades out this fast
   weightEaseMs: 220, // how quickly tiles grow and shrink
   openEaseMs: 260, // how quickly sessions open and close
   activeWindowMs: 2500, // a session that did something this recently stays open

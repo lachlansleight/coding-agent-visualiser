@@ -42,6 +42,8 @@ export function levelOf(tile, now) {
     }
   }
   if (tile.evictAt) level = Math.min(level, Math.max(0, 1 - (now - tile.evictAt) / 500));
+  // left over from the previous turn: fade out on the new turn's clock, whatever its own release
+  if (tile.decayFrom) level = Math.min(level, Math.max(0, 1 - (now - tile.decayFrom) / LIMITS.turnDecayMs));
   return level;
 }
 
@@ -51,6 +53,7 @@ function rise(tile, ts) {
     tile.onAt = ts;
   }
   tile.evictAt = 0;
+  tile.decayFrom = 0;
   tile.holdUntil = Math.max(tile.holdUntil, ts + ENV[tile.env].attack + LIMITS.minGateMs);
   tile.pulseAt = ts;
 }
@@ -133,6 +136,7 @@ export class Store {
         offAt: ts,
         holdUntil: 0,
         evictAt: 0,
+        decayFrom: 0,
         pulseAt: ts,
         version: 0,
         epoch: 0, // bumped when the content is replaced rather than added to
@@ -257,6 +261,9 @@ export class Store {
       s.turnTokens = 0;
       this.phase(s, 'starting', '', ts);
       for (const key of s.tiles.keys()) if (key.startsWith('reply:')) s.staleReply.add(key);
+      // Everything on screen now belongs to the turn that just ended. Anything
+      // still running keeps its envelope; anything that acts again is revived.
+      for (const tile of s.tiles.values()) if (tile.gates.size === 0) tile.decayFrom = ts;
       const tile = this.tile(s, 'prompt', 'prompt', 'prompt', ts);
       const text = String(d.prompt || '');
       const notice = /^\s*<task-notification>/.test(text);
